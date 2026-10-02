@@ -205,6 +205,12 @@ fi
 PROJECT_NAME=$(jq -r '.name // "Unknown"' app.json 2>/dev/null || echo "Unknown")
 info "Project: $PROJECT_NAME"
 
+# Detect test app — presence of Microsoft test framework dependencies
+IS_TEST_APP=false
+if jq -e '.dependencies[]? | select(.publisher == "Microsoft" and (.name == "Any" or .name == "Test Runner"))' app.json &>/dev/null 2>&1; then
+    IS_TEST_APP=true
+fi
+
 # Find AL extension and analyzers
 if $VERBOSE; then
     info "Searching for AL extension..."
@@ -218,7 +224,11 @@ if [[ -z "$AL_EXT_DIR" ]]; then
     exit 1
 fi
 
+# AL 18 moved the analyzers from bin/Analyzers/ to bin/; support both layouts.
 ANALYZER_DIR="$AL_EXT_DIR/bin/Analyzers"
+if [[ ! -d "$ANALYZER_DIR" && -f "$AL_EXT_DIR/bin/Microsoft.Dynamics.Nav.CodeCop.dll" ]]; then
+    ANALYZER_DIR="$AL_EXT_DIR/bin"
+fi
 AL_VERSION=$(basename "$AL_EXT_DIR" | sed 's/ms-dynamics-smb.al-//')
 
 if $VERBOSE; then
@@ -235,21 +245,37 @@ fi
 
 # Use compiler from extension (matches analyzer version)
 AL_COMPILER="$AL_EXT_DIR/$COMPILER_BIN"
+AL_COMPILER_LAUNCHER=()
 
 # Make sure compiler is executable
 if [[ ! -x "$AL_COMPILER" ]]; then
     chmod +x "$AL_COMPILER" 2>/dev/null || true
 fi
 
-# Verify compiler exists and is executable
-if [[ ! -x "$AL_COMPILER" ]]; then
+# From AL 18.0.2726309 the extension stopped shipping a native per-platform
+# binary (bin/linux/alc, bin/darwin/alc, bin/win32/alc.exe) and ships alc as a
+# framework-dependent .NET assembly at bin/alc.dll instead. Run that through
+# dotnet when the native binary is absent, so both layouts work.
+if [[ ! -x "$AL_COMPILER" && -f "$AL_EXT_DIR/bin/alc.dll" ]]; then
+    if command -v dotnet &>/dev/null; then
+        AL_COMPILER="$AL_EXT_DIR/bin/alc.dll"
+        AL_COMPILER_LAUNCHER=(dotnet)
+    else
+        error "AL ships alc as a .NET assembly ($AL_EXT_DIR/bin/alc.dll) but dotnet is not installed"
+        error "Install the .NET runtime, or use an AL extension that still ships bin/$COMPILER_BIN"
+        exit 1
+    fi
+fi
+
+# Verify compiler exists and is runnable
+if [[ ${#AL_COMPILER_LAUNCHER[@]} -eq 0 && ! -x "$AL_COMPILER" ]]; then
     error "AL compiler not found or not executable: $AL_COMPILER"
     error "Please ensure the AL extension is properly installed"
     exit 1
 fi
 
 if $VERBOSE; then
-    COMPILER_VERSION=$("$AL_COMPILER" version 2>&1 | grep "version" | head -1 || echo "Unknown")
+    COMPILER_VERSION=$("${AL_COMPILER_LAUNCHER[@]}" "$AL_COMPILER" version 2>&1 | grep "version" | head -1 || echo "Unknown")
     info "Compiler: $COMPILER_VERSION"
 fi
 
@@ -522,6 +548,7 @@ mkdir -p "$(dirname "$ERROR_LOG")"
 
 # Build compilation command
 COMPILE_CMD=(
+    "${AL_COMPILER_LAUNCHER[@]}"
     "$AL_COMPILER"
     /project:"."
     /packagecachepath:"$PACKAGE_PATH"
@@ -530,9 +557,22 @@ COMPILE_CMD=(
 
 # Add ruleset if found
 if [[ -n "$RULESET" ]]; then
-    COMPILE_CMD+=(/ruleset:"$RULESET")
     if $ENABLE_RULESETS; then
-        COMPILE_CMD+=(/enableexternalrulesets)
+        COMPILE_CMD+=(/ruleset:"$RULESET" /enableexternalrulesets)
+    elif grep -qE '"path"[[:space:]]*:[[:space:]]*"https?://' "$RULESET" 2>/dev/null; then
+        # --no-rulesets ("disable external ruleset support") is meaningless to the
+        # compiler if we still hand it a ruleset file whose content is (partly)
+        # an external includedRuleSets entry: alc refuses to load it at all
+        # without /enableexternalrulesets ("external rulesets are not allowed"),
+        # which defeats the whole point of the flag (falling back to compiling
+        # without an unreachable remote ruleset, e.g. on AL1033 / host rate-limit).
+        # Drop /ruleset entirely in that case so the compiler falls back to its
+        # own defaults instead of hard-failing a second time.
+        if $VERBOSE; then
+            info "Ruleset: skipped ($(basename "$RULESET") only resolves via an external include; --no-rulesets disables that)"
+        fi
+    else
+        COMPILE_CMD+=(/ruleset:"$RULESET")
     fi
 fi
 
